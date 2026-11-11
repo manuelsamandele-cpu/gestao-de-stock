@@ -1,0 +1,185 @@
+<!doctype html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#1d4ed8"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icon-192.png"><title>Gestão de Stock</title>
+<style>
+:root{--bl:#1d4ed8;--bd:#e2e8f0;--mu:#64748b;--ok:#166534;--er:#b91c1c}*{box-sizing:border-box}
+body{margin:0;font:16px system-ui,sans-serif;background:#f1f5f9;color:#0f172a;padding-bottom:64px}h1{color:var(--bl);margin:4px 0}h2{margin:6px 0}h3{margin:10px 0 4px}
+.top{background:var(--bl);color:#fff;padding:10px 14px;font-weight:700;display:flex;justify-content:space-between;align-items:center}.wrap{max-width:860px;margin:auto;padding:12px}
+.box{max-width:380px;margin:6vh auto;background:#fff;padding:16px;border-radius:12px}.c{background:#fff;border:1px solid var(--bd);border-radius:12px;padding:12px;margin-bottom:10px}.g{display:grid;grid-template-columns:1fr 1fr;gap:10px}.g .c{margin:0}
+.mu{color:var(--mu);font-size:13px}.big{font-size:19px;font-weight:700}.r{display:flex;justify-content:space-between;gap:8px;align-items:center}.ok{color:var(--ok)}.er{color:var(--er)}
+input,select{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font:inherit;margin:4px 0;background:#fff}label{font-size:14px;display:block}
+button{background:var(--bl);color:#fff;border:0;border-radius:8px;padding:10px 14px;font:inherit;cursor:pointer}button.s{background:#fff;color:#0f172a;border:1px solid #cbd5e1;padding:6px 10px;font-size:13px}a{color:var(--bl);cursor:pointer}
+nav{position:fixed;left:0;right:0;bottom:0;display:flex;overflow-x:auto;background:var(--bl);padding-bottom:env(safe-area-inset-bottom,0)}nav button{flex:0 0 auto;background:none;border-radius:0;padding:14px 14px}nav .on{background:rgba(0,0,0,.3);font-weight:700}
+</style></head><body><div id="app"></div>
+<textarea id="sql1" hidden>-- Gestão de Stock: executar no SQL Editor do Supabase
+create table stores(id uuid primary key default gen_random_uuid(), owner_id uuid not null unique references auth.users on delete cascade, name text not null, currency text not null default 'AOA', created_at timestamptz not null default now());
+create function my_store_id() returns uuid language sql stable security definer set search_path=public as $$ select id from stores where owner_id=auth.uid() limit 1 $$;
+create table profiles(id uuid primary key references auth.users on delete cascade, full_name text not null default '', created_at timestamptz not null default now());
+create table products(id uuid primary key default gen_random_uuid(), store_id uuid not null default my_store_id() references stores, name text not null check(length(trim(name))&gt;0), sku text, category text,
+ cost_price numeric(14,2) not null check(cost_price&gt;=0), sale_price numeric(14,2) not null check(sale_price&gt;=0), quantity numeric(14,3) not null default 0 check(quantity&gt;=0), min_stock numeric(14,3) not null default 0 check(min_stock&gt;=0),
+ archived_at timestamptz, created_at timestamptz not null default now(), unique(store_id,sku));
+create table customers(id uuid primary key default gen_random_uuid(), store_id uuid not null default my_store_id() references stores, name text not null, phone text, created_at timestamptz not null default now());
+create table sales(id uuid primary key default gen_random_uuid(), store_id uuid not null default my_store_id() references stores, customer_id uuid references customers, total numeric(14,2) not null check(total&gt;=0), cogs numeric(14,2) not null default 0,
+ payment_method text not null check(payment_method in ('numerario','multicaixa','transferencia','outro')), created_at timestamptz not null default now());
+create table sale_items(id uuid primary key default gen_random_uuid(), store_id uuid not null default my_store_id() references stores, sale_id uuid not null references sales, product_id uuid not null references products,
+ quantity numeric(14,3) not null check(quantity&gt;0), unit_price numeric(14,2) not null, unit_cost numeric(14,2) not null);
+create table stock_movements(id uuid primary key default gen_random_uuid(), store_id uuid not null default my_store_id() references stores, product_id uuid not null references products,
+ type text not null check(type in ('entrada','saida','ajuste','venda')), quantity numeric(14,3) not null, balance_after numeric(14,3) not null, unit_cost numeric(14,2), reason text, sale_id uuid references sales,
+ created_by uuid default auth.uid(), created_at timestamptz not null default now());
+create table expenses(id uuid primary key default gen_random_uuid(), store_id uuid not null default my_store_id() references stores, description text not null, category text, amount numeric(14,2) not null check(amount&gt;0), spent_on date not null default current_date, created_at timestamptz not null default now());
+create index on products(store_id,name); create index on stock_movements(store_id,created_at desc); create index on sales(store_id,created_at desc); create index on expenses(store_id,spent_on); create index on sale_items(sale_id);
+
+-- Novo utilizador =&gt; perfil + loja
+create function handle_new_user() returns trigger language plpgsql security definer set search_path=public as $$
+begin
+ insert into profiles(id,full_name) values(new.id,coalesce(new.raw_user_meta_data-&gt;&gt;'full_name',''));
+ insert into stores(owner_id,name) values(new.id,coalesce(nullif(new.raw_user_meta_data-&gt;&gt;'store_name',''),'A minha loja'));
+ return new; end $$;
+create trigger on_auth_user_created after insert on auth.users for each row execute function handle_new_user();
+
+-- RLS: cada comerciante só vê a sua loja. Histórico financeiro e de stock: sem update/delete.
+alter table profiles enable row level security; alter table stores enable row level security;
+create policy own on profiles for all using(id=auth.uid()) with check(id=auth.uid());
+create policy own_sel on stores for select using(owner_id=auth.uid());
+create policy own_upd on stores for update using(owner_id=auth.uid()) with check(owner_id=auth.uid());
+do $$ declare t text; begin
+ foreach t in array array['products','customers','expenses'] loop
+  execute format('alter table %I enable row level security',t);
+  execute format('create policy own on %I for all using(store_id=my_store_id()) with check(store_id=my_store_id())',t); end loop;
+ foreach t in array array['sales','sale_items','stock_movements'] loop
+  execute format('alter table %I enable row level security',t);
+  execute format('create policy own_sel on %I for select using(store_id=my_store_id())',t);
+  execute format('create policy own_ins on %I for insert with check(store_id=my_store_id())',t); end loop;
+end $$;
+
+-- A quantidade só muda através de funções (atómico, com histórico)
+create function guard_qty() returns trigger language plpgsql as $$ begin
+ if new.quantity is distinct from old.quantity and coalesce(current_setting('app.stock_rpc',true),'')&lt;&gt;'on' then raise exception 'Altere o stock apenas por movimentações'; end if; return new; end $$;
+create trigger products_guard before update on products for each row execute function guard_qty();
+
+create function register_stock_movement(p_product uuid,p_type text,p_qty numeric,p_reason text default null) returns void language plpgsql as $$
+declare prod products; delta numeric;
+begin
+ if p_type not in ('entrada','saida','ajuste') then raise exception 'Tipo inválido'; end if;
+ if p_qty is null or p_qty&lt;0 or (p_type&lt;&gt;'ajuste' and p_qty=0) then raise exception 'Quantidade inválida'; end if;
+ select * into prod from products where id=p_product and archived_at is null for update;
+ if not found then raise exception 'Produto não encontrado'; end if;
+ delta := case p_type when 'entrada' then p_qty when 'saida' then -p_qty else p_qty-prod.quantity end;
+ if prod.quantity+delta&lt;0 then raise exception 'Stock insuficiente (disponível: %)',prod.quantity; end if;
+ perform set_config('app.stock_rpc','on',true);
+ update products set quantity=quantity+delta where id=p_product;
+ insert into stock_movements(product_id,type,quantity,balance_after,unit_cost,reason) values(p_product,p_type,delta,prod.quantity+delta,prod.cost_price,p_reason);
+end $$;
+</textarea><textarea id="sql2" hidden>-- Fase 2: executar depois de schema.sql
+create function create_sale(p_customer uuid,p_method text,p_items jsonb) returns uuid language plpgsql security definer set search_path=public as $$
+declare st uuid:=my_store_id(); sid uuid; it jsonb; prod products; q numeric; tot numeric:=0; cg numeric:=0;
+begin
+ if st is null then raise exception 'Sem sessão'; end if;
+ if p_method not in ('numerario','multicaixa','transferencia','outro') then raise exception 'Método de pagamento inválido'; end if;
+ if jsonb_typeof(p_items)&lt;&gt;'array' or jsonb_array_length(p_items)=0 then raise exception 'Venda sem itens'; end if;
+ if p_customer is not null and not exists(select 1 from customers where id=p_customer and store_id=st) then raise exception 'Cliente inválido'; end if;
+ insert into sales(store_id,customer_id,total,cogs,payment_method) values(st,p_customer,0,0,p_method) returning id into sid;
+ perform set_config('app.stock_rpc','on',true);
+ for it in select * from jsonb_array_elements(p_items) loop
+  q:=(it-&gt;&gt;'quantity')::numeric;
+  if q is null or q&lt;=0 then raise exception 'Quantidade inválida'; end if;
+  select * into prod from products where id=(it-&gt;&gt;'product_id')::uuid and store_id=st and archived_at is null for update;
+  if not found then raise exception 'Produto não encontrado'; end if;
+  if prod.quantity&lt;q then raise exception 'Stock insuficiente para %: disponível %',prod.name,prod.quantity; end if;
+  update products set quantity=quantity-q where id=prod.id;
+  insert into sale_items(store_id,sale_id,product_id,quantity,unit_price,unit_cost) values(st,sid,prod.id,q,prod.sale_price,prod.cost_price);
+  insert into stock_movements(store_id,product_id,type,quantity,balance_after,unit_cost,reason,sale_id) values(st,prod.id,'venda',-q,prod.quantity-q,prod.cost_price,'Venda',sid);
+  tot:=tot+q*prod.sale_price; cg:=cg+q*prod.cost_price;
+ end loop;
+ update sales set total=tot,cogs=cg where id=sid;
+ return sid;
+end $$;
+</textarea>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+/* Safari/WebKit: o Supabase envia a sessão por BroadcastChannel (sincronização entre separadores); se o objeto não for clonável, lança DataCloneError. Ignora-se só esse envio. */
+if(window.BroadcastChannel){const BC=window.BroadcastChannel;window.BroadcastChannel=class extends BC{postMessage(m){try{super.postMessage(m)}catch(e){console.warn('BroadcastChannel ignorado:',e)}}}}
+addEventListener('unhandledrejection',e=>{const b=document.createElement('div');b.style.cssText='position:fixed;top:0;left:0;right:0;background:#b91c1c;color:#fff;padding:8px;font-size:13px;z-index:9';b.textContent='Erro: '+((e.reason&&e.reason.message)||e.reason);document.body.appendChild(b);setTimeout(()=>b.remove(),8000)});
+const $=id=>document.getElementById(id),kz=n=>new Intl.NumberFormat('pt-AO',{style:'currency',currency:'AOA'}).format(n).replace('AOA','Kz'),
+esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),
+num=x=>String(x).trim()===''?NaN:+String(x).replace(',','.'),dt=s=>new Date(s).toLocaleString('pt-AO'),v=id=>$(id)?$(id).value.trim():'',
+sm=(a,f)=>a.reduce((t,x)=>t+Number(f(x)),0),Q=async p=>{const r=await p;if(r.error)throw r.error;return r.data},
+fr=e=>/duplicate/i.test(e.message||'')?'Já existe um registo com esse código/SKU.':(e.message||String(e)),
+card=(l,x)=>`<div class="c"><div class="mu">${l}</div><div class="big">${kz(x)}</div></div>`,
+copy=id=>navigator.clipboard.writeText($(id).value).then(()=>alert('Copiado! Cole no SQL Editor do Supabase e toque em Run.'),()=>alert('Não foi possível copiar.')),
+today=()=>new Date().toLocaleDateString('sv-SE');
+let sb,user=null,tab='painel',msg=null,ed=null,cart=[],cache={},oc=null,mode='login',recovering=false,cfg=JSON.parse(localStorage.getItem('gs_cfg')||'null');
+const say=(t,ok)=>{msg={t,ok}},M=()=>msg?`<div class="c ${msg.ok?'ok':'er'}">${esc(msg.t)}</div>`:'';
+const framed=(()=>{try{return window.self!==window.top}catch(e){return true}})(),
+FR=framed?'<div class="c er" style="font-size:13px">⚠ A app está a abrir dentro de uma pré-visualização (iframe), que bloqueia a ligação ao Supabase. Abra o endereço publicado diretamente no Chrome ou Safari.</div>':'',
+sfetch=(i,o={})=>{const h={};try{new Headers(o.headers).forEach((x,y)=>{h[y]=x})}catch(e){}return fetch(i,{...o,headers:h})},
+mk=(u,k,o={})=>supabase.createClient(u,k,{...o,global:{fetch:sfetch}});
+async function act(fn){try{await fn()}catch(e){say(fr(e),0)}draw()}
+function setup(){$('app').innerHTML=`<div class="box"><h1>Gestão de Stock</h1>${FR}<h3>1. Base de dados</h3><p class="mu">No Supabase → SQL Editor → New query: cole e toque em Run, primeiro o SQL 1 e depois o SQL 2 (nova query).</p><button onclick="copy('sql1')">Copiar SQL 1</button> <button onclick="copy('sql2')">Copiar SQL 2</button><h3>2. Ligação</h3><input id="cu" placeholder="Project URL (https://xxxx.supabase.co)" value="${esc(cfg&&cfg.u)}"><input id="ck" placeholder="Chave anon public" value="${esc(cfg&&cfg.k)}"><button onclick="saveCfg()">Guardar e continuar</button><div id="cm"></div> ${cfg?'<button class="s" onclick="draw()">Voltar</button>':''}</div>`}
+async function saveCfg(){const out=(t,ok)=>{$('cm').innerHTML=`<div class="c ${ok?'ok':'er'}" style="margin-top:8px">${esc(t)}</div>`};
+ let u,k=v('ck').replace(/^["']|["']$/g,'').replace(/\s+/g,'');
+ try{u=new URL(v('cu').replace(/\s+/g,'')).origin}catch(e){return out('O Project URL é inválido. Exemplo: https://abcdxyz.supabase.co',0)}
+ if(!/^https:\/\/[a-z0-9-]+\.supabase\.(co|in)$/.test(u))return out('O URL deve ser o Project URL do Supabase (https://….supabase.co).',0);
+ if(k.length<20)return out('A chave parece incompleta. Use a Publishable key (sb_publishable_…) ou a anon public.',0);
+ let role='';try{role=JSON.parse(atob(k.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'))).role}catch(e){}
+ if(/^sb_secret_/.test(k)||role=='service_role')return out('Essa é uma chave SECRETA. Nunca a use aqui: use a Publishable key (sb_publishable_…) ou a anon public.',0);
+ if(typeof supabase==='undefined')return out('Não foi possível carregar a biblioteca do Supabase. Verifique a internet e recarregue a página.',0);
+ out('A testar a ligação…',1);
+ try{const r=await fetch(u+'/rest/v1/stores?select=id&limit=1',{headers:{apikey:k}});
+  if(r.status==401||r.status==403)return out('O Supabase recusou a chave (HTTP '+r.status+'). Confirme que o Project URL e a Publishable key são do mesmo projeto.',0);
+  if(r.status==404)return out('Ligação OK, mas as tabelas não existem: execute o SQL 1 e o SQL 2 no SQL Editor.',0);
+  if(!r.ok)return out('O Supabase respondeu com erro HTTP '+r.status+'.',0)}
+ catch(e){return out(e.name=='DataCloneError'||framed?'Este ambiente (pré-visualização/iframe) bloqueia o pedido de rede ('+e.name+'). Abra o endereço publicado diretamente no Chrome ou Safari.':'Sem ligação ao Supabase ('+e.name+': '+e.message+'). Verifique o Project URL e a internet.',0)}
+ try{const {error}=await mk(u,k,{auth:{persistSession:false,autoRefreshToken:false,detectSessionInUrl:false}}).from('stores').select('id').limit(1);if(error)throw error}
+ catch(e){return out('A biblioteca do Supabase falhou ('+(e.name||'Erro')+': '+(e.message||e)+').',0)}
+ try{localStorage.setItem('gs_cfg',JSON.stringify({u,k}))}catch(e){return out('Este navegador bloqueia o armazenamento local. Abra o endereço diretamente no Chrome ou Safari e saia do modo privado.',0)}
+ location.reload()}
+function auth(){const t={login:'Entrar',reg:'Criar conta',rec:'Recuperar palavra-passe'}[mode];$('app').innerHTML=`<form class="box" onsubmit="return doAuth(event)"><h1>Gestão de Stock</h1>${FR}<p class="mu">${t}</p>${mode=='reg'?'<input id="an" placeholder="O seu nome"><input id="as" placeholder="Nome da loja">':''}<input id="ae" type="email" placeholder="Email" required>${mode!='rec'?'<input id="ap" type="password" placeholder="Palavra-passe (mín. 8)" required>':''}${M()}<button>${t}</button><p><a onclick="mode=mode=='login'?'reg':'login';msg=null;auth()">${mode=='login'?'Criar conta':'Já tenho conta'}</a> · <a onclick="mode='rec';msg=null;auth()">Esqueci a palavra-passe</a> · <a onclick="setup()">Ligação</a></p></form>`}
+async function doAuth(e){e.preventDefault();msg=null;const em=v('ae'),pw=v('ap');try{if(mode!='rec'&&pw.length<8)throw Error('A palavra-passe deve ter pelo menos 8 caracteres.');
+ if(mode=='login')await Q(sb.auth.signInWithPassword({email:em,password:pw}));
+ else if(mode=='reg'){if(!v('an')||!v('as'))throw Error('Indique o seu nome e o nome da loja.');const d=await Q(sb.auth.signUp({email:em,password:pw,options:{data:{full_name:v('an'),store_name:v('as')}}}));if(!d.session)say('Conta criada. Confirme o email para entrar.',1)}
+ else{await Q(sb.auth.resetPasswordForEmail(em,{redirectTo:location.href.split('#')[0]}));say('Enviámos um link de recuperação para o seu email.',1)}}catch(x){say(x.message,0)}if(!user)auth();return false}
+function rec(){$('app').innerHTML=`<form class="box" onsubmit="return newPw(event)"><h1>Nova palavra-passe</h1><input id="np" type="password" placeholder="Nova palavra-passe (mín. 8)">${M()}<button>Guardar</button></form>`}
+async function newPw(e){e.preventDefault();try{if(v('np').length<8)throw Error('Mínimo 8 caracteres.');await Q(sb.auth.updateUser({password:v('np')}));recovering=false;msg=null;draw()}catch(x){say(x.message,0);rec()}return false}
+const TABS=[['painel','Painel'],['produtos','Produtos'],['stock','Stock'],['vendas','Vendas'],['despesas','Despesas'],['clientes','Clientes'],['relatorios','Relatórios'],['definicoes','Definições']],P={};
+async function draw(){if(!cfg)return setup();if(recovering)return rec();if(!user)return auth();let h;try{h=await P[tab]()}catch(e){h=`<div class="c er">${esc(fr(e))}</div>`}
+ $('app').innerHTML=`<div class="top">Gestão de Stock<button class="s" onclick="sb.auth.signOut()">Sair</button></div><div class="wrap">${M()}${h}</div><nav>${TABS.map(([k,l])=>`<button class="${tab==k?'on':''}" onclick="go('${k}')">${l}</button>`).join('')}</nav>`;msg=null}
+const go=t=>{tab=t;msg=null;ed=null;oc=null;draw()};
+P.painel=async()=>{const t=new Date();t.setHours(0,0,0,0);const [s,e,p]=await Promise.all([Q(sb.from('sales').select('total,cogs').gte('created_at',t.toISOString())),Q(sb.from('expenses').select('amount').eq('spent_on',today())),Q(sb.from('products').select('name,quantity,min_stock,cost_price').is('archived_at',null))]);
+ const vs=sm(s,x=>x.total),low=p.filter(x=>+x.quantity<=+x.min_stock);
+ return `<h2>Painel</h2><div class="g">${card('Vendas de hoje',vs)}${card('Despesas de hoje',sm(e,x=>x.amount))}${card('Lucro bruto estimado (hoje)',vs-sm(s,x=>x.cogs))}${card('Valor do stock (custo)',sm(p,x=>x.quantity*x.cost_price))}</div><div class="c" style="margin-top:10px"><b>Stock baixo (${low.length})</b>${low.map(x=>`<div class="r mu"><span>${esc(x.name)}</span><span class="er">${x.quantity} (mín. ${x.min_stock})</span></div>`).join('')||'<div class="mu">Nenhum produto com stock baixo.</div>'}</div>`};
+P.produtos=async()=>{const l=await Q(sb.from('products').select('*').is('archived_at',null).order('name'));cache.pr=l;
+ const F=[['name','Nome'],['sku','Código/SKU'],['category','Categoria'],['cost_price','Custo unitário (Kz)'],['sale_price','Preço de venda (Kz)'],...(ed&&ed.id?[]:[['quantity','Quantidade inicial']]),['min_stock','Stock mínimo']];
+ return `<div class="r"><h2>Produtos</h2><button onclick="ed={};draw()">+ Novo</button></div>`+(ed?`<form class="c" onsubmit="return saveProd(event)">${F.map(([k,t])=>`<label>${t}<input id="f_${k}" value="${esc(ed[k])}"></label>`).join('')}<button>Guardar</button> <button type="button" class="s" onclick="ed=null;draw()">Cancelar</button></form>`:'')+`<input id="srch" placeholder="Pesquisar…" oninput="filt()">`+
+ (l.map(p=>`<div class="c r" data-s="${esc((p.name+' '+(p.sku||'')+' '+(p.category||'')).toLowerCase())}"><div><b>${esc(p.name)}</b><div class="mu">${esc([p.sku,p.category].filter(Boolean).join(' · ')||'Sem código')}</div><div>${kz(p.sale_price)} <span class="mu">(custo ${kz(p.cost_price)})</span></div></div><div style="text-align:right"><b class="${+p.quantity<=+p.min_stock?'er':''}">${p.quantity}</b><br><button class="s" onclick="ed=cache.pr.find(x=>x.id=='${p.id}');draw()">Editar</button> <button class="s" onclick="arch('${p.id}')">Arquivar</button></div></div>`).join('')||'<div class="c mu">Ainda não tem produtos. Toque em “+ Novo”.</div>')};
+function filt(){const t=v('srch').toLowerCase();document.querySelectorAll('[data-s]').forEach(e=>e.style.display=e.dataset.s.includes(t)?'':'none')}
+function saveProd(e){e.preventDefault();act(async()=>{const g=k=>$('f_'+k)?$('f_'+k).value.trim():'',c=num(g('cost_price')),p=num(g('sale_price')),q=g('quantity')===''?0:num(g('quantity')),m=g('min_stock')===''?0:num(g('min_stock'));
+ if(!g('name'))throw Error('O nome é obrigatório.');if([c,p,q,m].some(x=>isNaN(x)||x<0))throw Error('Custo, preço e quantidades devem ser números iguais ou superiores a 0.');
+ const row={name:g('name'),sku:g('sku')||null,category:g('category')||null,cost_price:c,sale_price:p,min_stock:m};
+ if(ed.id)await Q(sb.from('products').update(row).eq('id',ed.id));else{const r=await Q(sb.from('products').insert({...row,quantity:0}).select('id').single());if(q>0)await Q(sb.rpc('register_stock_movement',{p_product:r.id,p_type:'entrada',p_qty:q,p_reason:'Stock inicial'}))}
+ ed=null;say('Produto guardado.',1)});return false}
+function arch(id){if(!confirm('Arquivar este produto? O histórico mantém-se.'))return;act(async()=>{await Q(sb.from('products').update({archived_at:new Date().toISOString()}).eq('id',id));say('Produto arquivado.',1)})}
+P.stock=async()=>{const [pr,h]=await Promise.all([Q(sb.from('products').select('id,name,quantity').is('archived_at',null).order('name')),Q(sb.from('stock_movements').select('type,quantity,balance_after,reason,created_at,products(name)').order('created_at',{ascending:false}).limit(50))]);
+ return `<h2>Movimentação de stock</h2><form class="c" onsubmit="return mov(event)"><select id="mp"><option value="">Produto…</option>${pr.map(p=>`<option value="${p.id}">${esc(p.name)} (${p.quantity})</option>`).join('')}</select><select id="mt"><option value="entrada">Entrada</option><option value="saida">Saída</option><option value="ajuste">Ajuste (quantidade contada)</option></select><input id="mq" inputmode="decimal" placeholder="Quantidade"><input id="mr" placeholder="Motivo"><button>Registar</button></form><h3>Histórico</h3>`+(h.map(x=>`<div class="c r"><div><b>${esc(x.products&&x.products.name)}</b><div class="mu">${x.type} · ${esc(x.reason||'sem motivo')} · ${dt(x.created_at)}</div></div><div style="text-align:right"><b class="${x.quantity<0?'er':'ok'}">${x.quantity>0?'+':''}${x.quantity}</b><div class="mu">saldo ${x.balance_after}</div></div></div>`).join('')||'<div class="c mu">Sem movimentações.</div>')};
+function mov(e){e.preventDefault();act(async()=>{const q=num(v('mq')),t=v('mt');if(!v('mp'))throw Error('Escolha um produto.');if(isNaN(q)||q<0||(t!='ajuste'&&q==0))throw Error('Quantidade inválida.');if(t!='entrada'&&!v('mr'))throw Error('Indique o motivo.');await Q(sb.rpc('register_stock_movement',{p_product:v('mp'),p_type:t,p_qty:q,p_reason:v('mr')||null}));say('Movimentação registada.',1)});return false}
+P.vendas=async()=>{const [pr,cu]=await Promise.all([Q(sb.from('products').select('id,name,sale_price,quantity').is('archived_at',null).gt('quantity',0).order('name')),Q(sb.from('customers').select('id,name').order('name'))]);cache.sp=pr;const t=sm(cart,l=>l.q*l.p);
+ return `<h2>Nova venda</h2><div class="c"><select id="sp"><option value="">Produto…</option>${pr.map(p=>`<option value="${p.id}">${esc(p.name)} · ${kz(p.sale_price)} (${p.quantity})</option>`).join('')}</select><input id="sq" inputmode="decimal" value="1"><button onclick="addCart()">Adicionar</button></div>`+
+ (cart.length?`<div class="c">${cart.map((l,i)=>`<div class="r"><span>${l.q} × ${esc(l.n)}</span><span>${kz(l.q*l.p)} <button class="s" onclick="cart.splice(${i},1);draw()">✕</button></span></div>`).join('')}<div class="r big"><span>Total</span><span>${kz(t)}</span></div><select id="sc"><option value="">Cliente (opcional)</option>${cu.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select><select id="spm"><option value="numerario">Numerário</option><option value="multicaixa">Multicaixa</option><option value="transferencia">Transferência</option><option value="outro">Outro</option></select><button onclick="finish()">Finalizar venda</button></div>`:'<div class="c mu">Carrinho vazio.</div>')};
+function addCart(){act(async()=>{const p=cache.sp.find(x=>x.id==v('sp')),n=num(v('sq'));if(!p||isNaN(n)||n<=0)throw Error('Escolha um produto e uma quantidade válida.');const l=cart.find(x=>x.id==p.id),t=(l?l.q:0)+n;if(t>p.quantity)throw Error('Stock insuficiente: disponível '+p.quantity+'.');if(l)l.q=t;else cart.push({id:p.id,n:p.name,p:p.sale_price,q:n})})}
+function finish(){act(async()=>{const t=sm(cart,l=>l.q*l.p);await Q(sb.rpc('create_sale',{p_customer:v('sc')||null,p_method:v('spm'),p_items:cart.map(l=>({product_id:l.id,quantity:l.q}))}));cart=[];say('Venda de '+kz(t)+' registada.',1)})}
+P.despesas=async()=>{const l=await Q(sb.from('expenses').select('*').order('spent_on',{ascending:false}).order('created_at',{ascending:false}).limit(100));
+ return `<h2>Despesas</h2><form class="c" onsubmit="return addExp(event)"><input id="xd" placeholder="Descrição"><input id="xc" placeholder="Categoria"><input id="xa" inputmode="decimal" placeholder="Valor (Kz)"><input id="xt" type="date" value="${today()}"><button>Registar</button></form>`+(l.map(x=>`<div class="c r"><div><b>${esc(x.description)}</b><div class="mu">${esc(x.category||'Sem categoria')} · ${x.spent_on}</div></div><b>${kz(x.amount)}</b></div>`).join('')||'<div class="c mu">Sem despesas.</div>')};
+function addExp(e){e.preventDefault();act(async()=>{const a=num(v('xa'));if(!v('xd')||isNaN(a)||a<=0||!v('xt'))throw Error('Indique descrição, valor superior a 0 e data.');await Q(sb.from('expenses').insert({description:v('xd'),category:v('xc')||null,amount:a,spent_on:v('xt')}));say('Despesa registada.',1)});return false}
+P.clientes=async()=>{const l=await Q(sb.from('customers').select('*').order('name'));let h=[];if(oc)h=await Q(sb.from('sales').select('total,payment_method,created_at').eq('customer_id',oc).order('created_at',{ascending:false}));
+ return `<h2>Clientes</h2><form class="c" onsubmit="return addCu(event)"><input id="cn" placeholder="Nome"><input id="cp" inputmode="tel" placeholder="Telefone"><button>Adicionar</button></form>`+(l.map(c=>`<div class="c"><div class="r"><div><b>${esc(c.name)}</b><div class="mu">${esc(c.phone||'Sem telefone')}</div></div><button class="s" onclick="oc=${oc==c.id?'null':"'"+c.id+"'"};draw()">Compras</button></div>${oc==c.id?(h.map(s=>`<div class="r mu"><span>${dt(s.created_at)} · ${s.payment_method}</span><span>${kz(s.total)}</span></div>`).join('')||'<div class="mu">Sem compras.</div>')+`<div class="r"><b>Total</b><b>${kz(sm(h,s=>s.total))}</b></div>`:''}</div>`).join('')||'<div class="c mu">Ainda sem clientes.</div>')};
+function addCu(e){e.preventDefault();act(async()=>{if(!v('cn'))throw Error('O nome é obrigatório.');await Q(sb.from('customers').insert({name:v('cn'),phone:v('cp')||null}));say('Cliente guardado.',1)});return false}
+P.relatorios=async()=>{const d=new Date(),f=cache.rf||new Date(d.getFullYear(),d.getMonth(),1).toLocaleDateString('sv-SE'),t=cache.rt||today();
+ const a=new Date(f+'T00:00:00').toISOString(),b=new Date(new Date(t+'T00:00:00').getTime()+864e5).toISOString();
+ const [s,e,m]=await Promise.all([Q(sb.from('sales').select('total,cogs').gte('created_at',a).lt('created_at',b).limit(10000)),Q(sb.from('expenses').select('amount').gte('spent_on',f).lte('spent_on',t).limit(10000)),Q(sb.from('stock_movements').select('type,quantity,created_at,products(name)').gte('created_at',a).lt('created_at',b).order('created_at',{ascending:false}).limit(200))]);
+ const vs=sm(s,x=>x.total),cg=sm(s,x=>x.cogs),ex=sm(e,x=>x.amount);
+ return `<h2>Relatórios</h2><div class="c"><label>De<input id="rf" type="date" value="${f}"></label><label>Até<input id="rt" type="date" value="${t}"></label><button onclick="cache.rf=v('rf');cache.rt=v('rt');draw()">Ver</button></div><div class="g">${card('Vendas ('+s.length+')',vs)}${card('Custo das mercadorias',cg)}${card('Lucro bruto estimado',vs-cg)}${card('Despesas',ex)}${card('Resultado (lucro − despesas)',vs-cg-ex)}</div><h3>Movimentação de stock (${m.length})</h3>`+(m.map(x=>`<div class="c r"><span>${esc(x.products&&x.products.name)} · ${x.type} · ${dt(x.created_at)}</span><b class="${x.quantity<0?'er':'ok'}">${x.quantity>0?'+':''}${x.quantity}</b></div>`).join('')||'<div class="c mu">Sem movimentos no período.</div>')};
+P.definicoes=async()=>{const [s,p]=await Promise.all([Q(sb.from('stores').select('id,name').single()),Q(sb.from('profiles').select('full_name').single())]);cache.st=s.id;
+ return `<h2>Definições</h2><form class="c" onsubmit="return saveSt(event)"><label>Nome da loja<input id="dn" value="${esc(s.name)}"></label><label>O seu nome<input id="dp" value="${esc(p.full_name)}"></label><label>Moeda<input value="Kwanza angolano (Kz / AOA)" readonly></label><button>Guardar</button></form><form class="c" onsubmit="return savePw(event)"><input id="dw" type="password" placeholder="Nova palavra-passe (mín. 8)"><button>Alterar palavra-passe</button></form><div class="c"><button class="s" onclick="setup()">Alterar ligação ao Supabase</button></div>`};
+function saveSt(e){e.preventDefault();act(async()=>{if(!v('dn')||!v('dp'))throw Error('Preencha os dois nomes.');await Q(sb.from('stores').update({name:v('dn')}).eq('id',cache.st));await Q(sb.from('profiles').update({full_name:v('dp')}).eq('id',user.id));say('Definições guardadas.',1)});return false}
+function savePw(e){e.preventDefault();act(async()=>{if(v('dw').length<8)throw Error('Mínimo 8 caracteres.');await Q(sb.auth.updateUser({password:v('dw')}));say('Palavra-passe alterada.',1)});return false}
+function boot(){if(!cfg)return setup();if(typeof supabase==='undefined'){$('app').innerHTML='<div class="box c er">Não foi possível carregar a biblioteca do Supabase. Verifique a internet e recarregue a página.</div>';return}sb=mk(cfg.u,cfg.k);sb.auth.onAuthStateChange((ev,s)=>{if(ev=='PASSWORD_RECOVERY'){recovering=true;user=s&&s.user;return rec()}const id=s&&s.user&&s.user.id;if(ev=='INITIAL_SESSION'||id!==(user&&user.id)){user=(s&&s.user)||null;draw()}})}
+if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});boot();
+</script></body></html>
